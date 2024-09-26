@@ -1,0 +1,143 @@
+clear all
+%field_init
+trans.fc=3e6;
+trans.numele = 16;
+trans.width =3.3/1000; 
+trans.pitch = 3.5/1000;  
+trans.kerf=trans.pitch-trans.width;
+trans.heigh=3.3/1000;
+trans.elevationFocus =110/1000; 
+trans.focus=[0 0 110]/1000;
+trans.ElementPos.x = trans.pitch*(-((trans.numele-1)/2):((trans.numele-1)/2));
+trans.ElementPos.z = 0.11 - sqrt(0.11^2 - trans.ElementPos.x.^2);
+trans.c = 1540; 
+focus = [0 0 30]/1000;
+rf_data = gpuArray.zeros(2252,16,16);
+xT = gpuArray(trans.ElementPos.x);
+zT = gpuArray(trans.ElementPos.z);
+
+userset.theta = -pi/4;
+userset.fs=21e6; 
+userset.dep1=0; 
+userset.dep2=100/1000; 
+userset.lat1=trans.ElementPos.x(1); 
+userset.lat2=trans.ElementPos.x(end); 
+userset.txfocus=30/1000;
+userset.Raynum=16;
+userset.rayDelta = 2*(-userset.theta)/(userset.Raynum-1);
+userset.aperture = 16*trans.pitch;
+trans.radius = -(userset.aperture/2)/tan(-userset.theta);
+emit = xdc_linear_array(trans.numele, trans.width, trans.heigh, trans.kerf, 1, 1, focus);
+rcv = xdc_linear_array(trans.numele, trans.width, trans.heigh, trans.kerf, 1, 1, focus);
+
+impulse=sin(2*pi*trans.fc*(0:1/userset.fs:2/trans.fc));
+impulse_response=impulse.*hanning(max(size(impulse)))';
+xdc_impulse(emit,impulse_response);  
+xdc_impulse(rcv,impulse_response);
+excitation=sin(2*pi*trans.fc*(0:1/userset.fs:2/trans.fc)); 
+xdc_excitation(emit,excitation);  
+set_sampling(userset.fs)
+
+
+Angles= userset.theta:userset.rayDelta:(userset.theta + (userset.Raynum-1)*userset.rayDelta);
+txfocus=userset.txfocus;
+
+for i=1:userset.Raynum
+    txorigin=-(trans.radius*tan(Angles(i)));
+    txsteer=Angles(i);
+
+    [x_focus,z_focus]=calc_focal(txorigin,txsteer);
+
+    tx_dd(i,:) = calc_delay(xT,zT, x_focus, z_focus); 
+
+    xdc_apodization(emit,0,ones(1,trans.numele));
+    xdc_apodization(rcv,0,ones(1,trans.numele));
+    xdc_center_focus(emit,[0 0 0]);
+    xdc_focus_times(emit, zeros(1, 1), gather(tx_dd(i, :)));  
+xdc_focus_times(rcv, zeros(1, 1), gather(zeros(1, trans.numele)));  
+
+    point_pos=[ 0 0 10;
+            0 0 20;
+            0 0 30;
+            0 0 40;
+            0 0 50;
+            0 0 60;
+            0 0 70 ]/1000;
+    point_amp=20*ones(1,max(size(point_pos)));
+    [v_temp,tstart(i)]=calc_scat_multi(emit,rcv,point_pos,point_amp');
+    rf_data(1:max(size(v_temp)),:,i)=v_temp; 
+end
+
+[xx,zz]=ImageRegion(userset.lat1,userset.lat2,userset.dep1,userset.dep2);
+x = gpuArray(xx(:));   
+z = gpuArray(zz(:));  
+rf = gpuArray(hilbert(rf_data));
+dasdata = gpuArray.zeros(size(xx, 1), size(xx, 2));
+tic
+for ii=1:userset.Raynum
+    rf_an=gpuArray(rf(:, :, ii));        
+    
+    for ix = 1:length(x)
+        for iz = 1:length(z)
+            x_current = x(ix);
+            z_current = z(iz);
+            dTX = sqrt(x_current^2 + (z_current - trans.radius)^2);  
+            dRX = sqrt((xT - x_current).^2 + (zT-z_current).^2);  
+            tau = (dTX + dRX) / trans.c ;  
+            %tau = (dTX + dRX) / trans.c + max(tx_dd(ii));
+            dasdata(iz, ix) = das(gpuArray(rf_an),userset.fs, tau, trans);
+        end
+    end
+end
+ 
+FrameData = gather(abs(dasdata));  
+DisplayData = FrameData;  
+maxd = max(abs(DisplayData(:)));
+f1 = figure;
+imagesc(x*1000,z*1000,20*log10(FrameData/maxd),[-60,0]);colorbar;
+
+
+function [x_focus, z_focus] = calc_focal(txorigin, txsteer)
+
+     txfocus = 30/1000; 
+    if isempty(txorigin) || isempty(txsteer)
+        error('txorigin or txsteer is empty');
+    end
+    x_focus = txorigin + txfocus * tan(txsteer); 
+    z_focus = txfocus;
+    
+end 
+
+
+function delays = calc_delay(xT,zT, x_focus, z_focus)
+
+    if isempty(x_focus) || isempty(z_focus)
+        error('x_focus or z_focus is empty');
+    end
+    x_focus = x_focus(:)';  
+    z_focus = z_focus(:)';  
+    distances = sqrt((xT - x_focus).^2 + (zT-z_focus).^2);
+    delays = distances / 1540; 
+   
+end
+
+function [xx, zz] = ImageRegion(lat1, lat2, dep1, dep2)
+
+    lateral_res = 1/1000;  
+    depth_res = 1/1000;        
+    lateral = lat1:lateral_res:lat2;  
+    depth = dep1:depth_res:dep2;          
+    [xx, zz] = meshgrid(lateral, depth);  
+end
+
+
+function pixel_value = das(rf_an,fs, tau, trans)
+
+    time_samples = tau * fs;
+    pixel_value = gpuArray(0);    
+    for elem = 1:trans.numele
+        if time_samples(elem) > 0 && time_samples(elem) <= size(rf_an, 1)
+            pixel_value = pixel_value + interp1(gpuArray(1:size(rf_an, 1)), rf_an(:, elem), time_samples(elem), 'linear', 0);
+        end
+    end
+end
